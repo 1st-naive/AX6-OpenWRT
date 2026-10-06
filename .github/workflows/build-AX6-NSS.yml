@@ -1,11 +1,20 @@
 name: Build OpenWRT for AX6-NSS
 
+# 修复点 1/5：允许 workflow 创建/更新 Release（解决 403 Resource not accessible by integration）
+# 配合：仓库 Settings -> Actions -> General -> Workflow permissions 选 "Read and write"
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
 
 env:
   REPO_URL: https://github.com/VIKINGYFY/immortalwrt.git
   REPO_BRANCH: main
+  # 钉版本开关：留空 = 跟随 main 最新提交；
+  # 填 0fb9b10cb9df51fb076470e1dd93d1c30dd89d83 = 回到"已知可编译"的版本
+  # （就是你路由器现在跑的 r0-0fb9b10，run #4 用这棵树编译成功过）。
+  PIN_COMMIT: ""
   CONFIG_FILE: AX6-IPQ/.config
   DIY_SH: AX6-IPQ/diy.sh
   FILES: AX6-IPQ/files
@@ -33,7 +42,7 @@ jobs:
         echo -e  "硬盘数量：$(ls /dev/sd* | grep -v [1-9] | wc -l) \n"
         echo "硬盘详情："
         df -Th
-        
+
     - name: Before freeing up disk space
       run: |
         echo "Before freeing up disk space"
@@ -62,27 +71,42 @@ jobs:
         npm_clean: "True"
         os_swap: "True"
 
-    - name: Freeing up disk space
-      uses: easimon/maximize-build-space@master
-      with: 
-        root-reserve-mb: 10240
-        swap-size-mb: 1
-        remove-dotnet: 'true'
-        remove-android: 'true'
-        remove-haskell: 'true'
-        remove-codeql: 'true'
-        remove-docker-images: 'true'
-
-    - name: Free up disk space complete
+    # 修复点 2/5：删掉 easimon/maximize-build-space！
+    # 它原本想用 "/mnt 临时盘" 拼 LVM 扩容，但你的 runner 上 /mnt 就在 / 里面
+    # （df 输出里根本没有 /mnt 这一行），于是两个镜像文件全落在 / 上：
+    #   /pv.img + /mnt/tmp-pv.img  ->  / 被吃到只剩 temp-reserve-mb(默认100MB)
+    # 实测：/ 总 146G、可用从 ~121G 变成 101M，而换来的 buildlv 只有 121G —— 净收益为 0，
+    # 却让 apt（装在 /）必然 ENOSPC。所以这里改成自己删大件，空间全部留在 / 上。
+    - name: Remove large unused toolchains
       run: |
-        echo "Free up disk space complete"
-        echo "=============================================================================="
+        set -x
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /usr/local/.ghcup
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/local/share/boost
+        sudo rm -rf /usr/share/swift
+        sudo rm -rf /usr/local/share/powershell
+        sudo apt-get clean
+        docker image prune -af || true
+        set +x
         df -hT
-        echo "=============================================================================="
-        
+
+    # 修复点 3/5：10 秒内快速守卫。空间不够就直接失败，别白等 3-4 小时。
+    - name: Verify disk space
+      run: |
+        df -hT
+        FREE_MB=$(df -Pm / | awk 'NR==2 {print $4}')
+        echo "根分区可用: ${FREE_MB} MB"
+        if [ "${FREE_MB}" -lt 20480 ]; then
+          echo "::error::/ 只剩 ${FREE_MB} MB，编译必然中途 ENOSPC。请重跑本工作流换一台 runner。"
+          exit 1
+        fi
+
     - name: Checkout
       uses: actions/checkout@main
-      
+
     - name: Initialize environment
       env:
         DEBIAN_FRONTEND: noninteractive
@@ -101,6 +125,14 @@ jobs:
       working-directory: ./
       run: |
         git clone $REPO_URL -b $REPO_BRANCH openwrt
+        # 修复点 4/5（可选）：把上方 env 里的 PIN_COMMIT 填成
+        # 0fb9b10cb9df51fb076470e1dd93d1c30dd89d83 即可回到已知可编译的树，
+        # 绕开上游合并后的内核配置漂移（NET_DSA_TAG_OOB 那个 syncconfig 报错）。
+        if [ -n "$PIN_COMMIT" ]; then
+          git -C openwrt checkout "$PIN_COMMIT"
+        fi
+        echo "本次使用的上游提交："
+        git -C openwrt log --oneline -1
 
     - name: cache wrt build
       uses: stupidloud/cachewrtbuild@main
@@ -108,7 +140,7 @@ jobs:
         ccache: 'true'
         mixkey: AX6-NSS-${{ env.REPO_BRANCH }}
         prefix: ${{ github.workspace }}/openwrt
-        
+
     - name: Update & Install feeds
       working-directory: ./openwrt
       run: |
@@ -127,6 +159,21 @@ jobs:
       # uses: P3TERX/ssh2actions@main
       # if: (github.event.inputs.ssh == 'true') || contains(github.event.action, 'ssh')
 
+    # 内核配置漂移：上游合并后内核升到 6.18.54，kconfig 出现新符号 NET_DSA_TAG_OOB，
+    # 而 qualcommax/generic 的 config-6.18 没同步 -> syncconfig 报错。
+    # 这里把缺失的符号显式补进目标 config 片段（幂等）。上游同步好之后可删。
+    - name: Fix kernel config drift
+      working-directory: ./openwrt
+      run: |
+        TCFG=target/linux/qualcommax/config-6.18
+        echo "== 现有 NET_DSA 相关配置 =="
+        grep -n 'NET_DSA' "$TCFG" target/linux/generic/config-6.18 2>/dev/null || echo "(未找到 NET_DSA 配置)"
+        if [ -f "$TCFG" ] && ! grep -q 'NET_DSA_TAG_OOB' "$TCFG" target/linux/generic/config-6.18 2>/dev/null; then
+          echo '# CONFIG_NET_DSA_TAG_OOB is not set' >> "$TCFG"
+          echo "已补齐 CONFIG_NET_DSA_TAG_OOB 到 $TCFG"
+        fi
+        df -hT .
+
     - name: Download package
       working-directory: ./openwrt
       run: |
@@ -134,6 +181,8 @@ jobs:
         # Linux 6.18 bonding triggers unused-function warnings; defconfig may re-enable WERROR.
         sed -i 's/^CONFIG_KERNEL_WERROR=y$/# CONFIG_KERNEL_WERROR is not set/' .config
         make defconfig
+        echo "== 确认 WERROR 状态 =="
+        grep -n 'CONFIG_KERNEL_WERROR' .config || true
         make download -j8
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
@@ -146,22 +195,29 @@ jobs:
         make -j$(nproc) || make -j1 || make -j1 V=s
         echo "compile_status=success" >> $GITHUB_ENV
 
-    # - name : Upload packages
-      # uses: actions/upload-artifact@master
-      # if: always()
-      # with:
-        # name: AX6-NSS
-        # path: openwrt/bin/targets
     - name: cp output to upload file
       run: |
         df -hT
         mkdir upload
         cp openwrt/bin/targets/*/*/*.ubi upload/
         cp openwrt/bin/targets/*/*/*.bin upload/
-        
+
+    # 修复点 5/5：先把产物传成 Artifact 再发 Release，
+    # 即使 Release 再出 403/网络问题，固件也不会像上次那样丢掉。
+    - name: Upload firmware artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: AX6-NSS-firmware
+        path: |
+          upload/*
+          openwrt/build_dir/target-*/linux-*/*/.config
+        if-no-files-found: warn
+        retention-days: 7
+
     - name: Get Current Date
       run: echo "CURRENT_DATE=$(date '+%Y%m%d%H%M%S')" >> $GITHUB_ENV
-      
+
     - name: Upload OpenWrt Firmware to Release
       uses: ncipollo/release-action@main
       with:
