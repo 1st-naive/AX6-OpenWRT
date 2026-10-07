@@ -19,12 +19,18 @@ git_sparse_clone main https://github.com/fightroad/luci-app-easytier easytier ea
 # Socat 端口转发 LuCI（Lienol 版，兼容新版 socat，配置用 luci_socat 不冲突）
 git_sparse_clone main https://github.com/Lienol/openwrt-package luci-app-socat
 
-# PassWall 科学上网（xiaorouji 源，替换 feeds 自带版本）
-rm -rf feeds/packages/net/{xray-core,v2ray-geoip,v2ray-geodata,v2ray-geosite,v2ray-geosite-ir,sing-box,chinadns-ng,dns2socks,hysteria,ipt2socks,microsocks,naiveproxy,shadowsocks-rust,shadowsocksr-libev,simple-obfs,tcping,v2ray-plugin,xray-plugin,geoview,shadow-tls}
-rm -rf feeds/luci/applications/luci-app-passwall
-rm -rf package/openwrt-passwall-packages package/openwrt-passwall
-git clone --depth 1 https://github.com/xiaorouji/openwrt-passwall-packages package/openwrt-passwall-packages
-git clone --depth 1 https://github.com/xiaorouji/openwrt-package package/openwrt-passwall
+# nikki（透明代理，mihomo 内核）：官方要求以 feed 方式接入，必须在 feeds install 之后补做
+# 注意：workflow 里 feeds update/install 在本脚本之前执行，所以这里要自己补一次
+if ! grep -q 'src-git nikki' feeds.conf.default; then
+  echo 'src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' >> feeds.conf.default
+fi
+./scripts/feeds update nikki
+./scripts/feeds install -a -p nikki || {
+  echo "feeds install 失败，回退为直接克隆到 package/" >&2
+  git clone --depth=1 https://github.com/nikkinikki-org/OpenWrt-nikki.git package/nikki-openwrt
+}
+# 说明：本 feed 含 nikki / luci-app-nikki / mihomo-meta(默认核心, PROVIDES mihomo) / mihomo-alpha
+# mihomo 是 Go 程序，首次编译会连带编 Go host 工具链，约多 10-20 分钟
 
 # frp：用官方预编译包替换 Imm 源码编译（避免 node/host 编 WebUI 失败）
 # 保留 feeds 里 Imm 的 files/（init、uci），LuCI 仍用官方 luci-app-frpc
@@ -47,6 +53,19 @@ chmod +x "$DIY_DIR/frp/patch_enable.sh"
 "$DIY_DIR/frp/patch_enable.sh" \
   "feeds/packages/net/frp/files" \
   "feeds/luci/applications/luci-app-frpc/htdocs/luci-static/resources/view/frpc.js"
+
+# ============================================================================
+# 配置纠正（幂等）：关掉 PassWall 全家 / ISC-DHCP(IPv6) / 网络共享 / GecoosAC，
+# 打开 nikki + kmod-tcp-bbr，并确保 UPnP / ZeroTier / smartdns / IPv6 不被误关。
+# 必须在 make defconfig 之前执行 —— workflow 里 defconfig 在下一个步骤，顺序正确。
+# 如果不想用脚本，删掉这一段即可（那就靠 AX6-IPQ/.config 里已经改好的内容）。
+# ============================================================================
+if [ -f "$DIY_DIR/apply-config.sh" ]; then
+  sh "$DIY_DIR/apply-config.sh" .config
+else
+  echo "WARNING: 缺少 $DIY_DIR/apply-config.sh，跳过配置纠正" >&2
+fi
+
 #git clone --depth 1 https://github.com/jerrykuku/luci-theme-argon package/luci-theme-argon
 #git clone --depth 1 https://github.com/jerrykuku/luci-app-argon-config package/luci-app-argon-config
 #git clone --depth 1 https://github.com/sirpdboy/luci-app-ddns-go package/ddnsgo
