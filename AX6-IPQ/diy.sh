@@ -47,6 +47,30 @@ if [ -f feeds.conf.default ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 1.5) 规避 miniupnpd 补丁不兼容
+#      feeds/packages 于 2026-10-07 把 miniupnpd 升到 2.3.11，但
+#      patches/020-descr-filter-fix.patch 仍按旧版行号编写，导致
+#      "5 out of 7 hunks FAILED" / "2 out of 2 hunks FAILED" 编译中断。
+#      上游尚未修复，这里移除该补丁（仅失去 describe 字段过滤修复，
+#      保留 2.3.11 的 PinholeVerification 堆溢出修复）。
+#      OpenWrt 的 Build/Prepare 只遍历 patches/*.patch，文件移除即跳过。
+# ---------------------------------------------------------------------------
+MINIUPNPD_PATCHES="feeds/packages/net/miniupnpd/patches"
+if [ -d "$MINIUPNPD_PATCHES" ]; then
+	echo "==> [diy] 处理 miniupnpd 补丁兼容性"
+	for p in 020-descr-filter-fix.patch; do
+		if [ -f "$MINIUPNPD_PATCHES/$p" ]; then
+			echo "==> [diy]   移除不兼容补丁 $p"
+			rm -f "$MINIUPNPD_PATCHES/$p"
+		fi
+	done
+	# 顺手清掉上一轮失败留下的 .rej / .orig，避免污染源码树
+	find feeds/packages/net/miniupnpd -name '*.rej' -delete 2>/dev/null || true
+	find feeds/packages/net/miniupnpd -name '*.orig' -delete 2>/dev/null || true
+	echo "==> [diy]   剩余补丁：$(ls "$MINIUPNPD_PATCHES"/*.patch 2>/dev/null | wc -l) 个"
+fi
+
+# ---------------------------------------------------------------------------
 # 2) 应用精简配置（幂等：翻转符号，不整文件覆盖，保留 make defconfig 的推导结果）
 # ---------------------------------------------------------------------------
 if [ -f "$DIY_DIR/apply-config.sh" ]; then
