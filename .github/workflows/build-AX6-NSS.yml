@@ -1,6 +1,6 @@
 name: Build OpenWRT for AX6-NSS
 
-# 修复点 1/5：允许 workflow 创建/更新 Release（解决 403 Resource not accessible by integration）
+# 允许 workflow 创建/更新 Release（解决 403 Resource not accessible by integration）
 # 配合：仓库 Settings -> Actions -> General -> Workflow permissions 选 "Read and write"
 permissions:
   contents: write
@@ -13,7 +13,6 @@ env:
   REPO_BRANCH: main
   # 钉版本开关：留空 = 跟随 main 最新提交；
   # 填 0fb9b10cb9df51fb076470e1dd93d1c30dd89d83 = 回到"已知可编译"的版本
-  # （就是你路由器现在跑的 r0-0fb9b10，run #4 用这棵树编译成功过）。
   PIN_COMMIT: ""
   CONFIG_FILE: AX6-IPQ/.config
   DIY_SH: AX6-IPQ/diy.sh
@@ -27,25 +26,17 @@ jobs:
     steps:
     - name: Check machine configuration
       run: |
-        echo "警告⚠"
-        echo "分配的服务器性能有限，若选择的插件过多，务必注意CPU性能！"
-        echo "云编译建议取消勾选Node.js及其相关插件！"
-        echo "已知CPU型号（降序）：7763,8370C,8272CL,8171M,E5系列"
         echo "--------------------------CPU信息--------------------------"
-        echo "CPU物理数量:$(cat /proc/cpuinfo| grep "physical id"| sort| uniq| wc -l)"
+        echo "CPU物理数量:$(cat /proc/cpuinfo | grep "physical id" | sort | uniq | wc -l)"
         echo -e "CPU核心及版本信息：$(cat /proc/cpuinfo | grep name | cut -f2 -d: | uniq -c) \n"
         echo "--------------------------内存信息--------------------------"
-        echo "已安装内存详细信息："
         sudo lshw -short -C memory | grep GiB
         echo -e "\n"
         echo "--------------------------硬盘信息--------------------------"
-        echo -e  "硬盘数量：$(ls /dev/sd* | grep -v [1-9] | wc -l) \n"
-        echo "硬盘详情："
         df -Th
 
     - name: Before freeing up disk space
       run: |
-        echo "Before freeing up disk space"
         echo "=============================================================================="
         df -hT
         echo "=============================================================================="
@@ -69,14 +60,14 @@ jobs:
         homebrew_clean: "True"
         npm_prune: "True"
         npm_clean: "True"
-        os_swap: "True"
+        # 不删除系统 swap 文件：与本流程无关，且盘紧张时会加重问题
+        os_swap: "False"
 
-    # 修复点 2/5：删掉 easimon/maximize-build-space！
-    # 它原本想用 "/mnt 临时盘" 拼 LVM 扩容，但你的 runner 上 /mnt 就在 / 里面
-    # （df 输出里根本没有 /mnt 这一行），于是两个镜像文件全落在 / 上：
-    #   /pv.img + /mnt/tmp-pv.img  ->  / 被吃到只剩 temp-reserve-mb(默认100MB)
-    # 实测：/ 总 146G、可用从 ~121G 变成 101M，而换来的 buildlv 只有 121G —— 净收益为 0，
-    # 却让 apt（装在 /）必然 ENOSPC。所以这里改成自己删大件，空间全部留在 / 上。
+    # 不要使用 easimon/maximize-build-space！
+    # 它靠 fallocate 出 /pv.img 与 /mnt/tmp-pv.img 拼 LVM 扩容，但本 runner 的 /mnt
+    # 就在 / 里面（df 输出没有 /mnt 这一行），两个镜像文件全部落在 / 上：
+    #   / 总 146G、可用从 ~121G 变成 101M，而换来的 buildlv 只有 121G —— 净收益为 0，
+    #   却让 apt（装在 /）必然 ENOSPC。所以改成自己删大件，空间全部留在 / 上。
     - name: Remove large unused toolchains
       run: |
         set -x
@@ -93,7 +84,6 @@ jobs:
         set +x
         df -hT
 
-    # 修复点 3/5：10 秒内快速守卫。空间不够就直接失败，别白等 3-4 小时。
     - name: Verify disk space
       run: |
         df -hT
@@ -122,12 +112,8 @@ jobs:
         sudo chown $USER:$GROUPS $GITHUB_WORKSPACE
 
     - name: Clone source code
-      working-directory: ./
       run: |
         git clone $REPO_URL -b $REPO_BRANCH openwrt
-        # 修复点 4/5（可选）：把上方 env 里的 PIN_COMMIT 填成
-        # 0fb9b10cb9df51fb076470e1dd93d1c30dd89d83 即可回到已知可编译的树，
-        # 绕开上游合并后的内核配置漂移（NET_DSA_TAG_OOB 那个 syncconfig 报错）。
         if [ -n "$PIN_COMMIT" ]; then
           git -C openwrt checkout "$PIN_COMMIT"
         fi
@@ -147,19 +133,45 @@ jobs:
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: Load custom config
+    # 注意：必须在 cd openwrt 之后调用 diy.sh，diy.sh 内部用绝对路径但需要正确的顶层目录。
+    # diy.sh 末尾会 touch /tmp/diy-ok，这里做存在性断言，避免"脚本中途退出却没人发现"。
+    - name: Load custom config and run diy.sh
       run: |
+        set -e
+        # 清掉可能残留的旧标记，防止误判
+        rm -f /tmp/diy-ok
+
         [ -e $FILES ] && mv $FILES openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        if [ ! -e $CONFIG_FILE ]; then
+          echo "::error::找不到 $CONFIG_FILE"
+          exit 1
+        fi
+        mv $CONFIG_FILE openwrt/.config
+        echo "== .config 行数：$(wc -l < openwrt/.config) =="
+        grep -q '^CONFIG_TARGET_qualcommax_ipq807x_DEVICE_redmi_ax6-stock=y$' openwrt/.config \
+          || { echo "::error::.config 里缺少 redmi_ax6-stock 的 profile 符号"; exit 1; }
+        echo "== profile 符号 OK =="
+
         chmod +x $DIY_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_SH
 
-    # - name: SSH connect to Actions
-      # uses: P3TERX/ssh2actions@main
-      # if: (github.event.inputs.ssh == 'true') || contains(github.event.action, 'ssh')
+        if [ ! -f /tmp/diy-ok ]; then
+          echo "::error::diy.sh 未正常结束（缺少 /tmp/diy-ok 标记），请查看上方 diy 日志"
+          exit 1
+        fi
+        echo "== diy.sh 执行完成 =="
 
-    # 内核配置漂移：上游合并后内核升到 6.18.54，kconfig 出现新符号 NET_DSA_TAG_OOB，
+        # 二次断言：miniupnpd 不兼容补丁必须已被移除
+        if ls feeds/packages/net/miniupnpd/patches/020-descr-filter-fix.patch \
+              package/feeds/packages/miniupnpd/patches/020-descr-filter-fix.patch \
+              >/dev/null 2>&1; then
+          echo "::error::miniupnpd 不兼容补丁仍在，diy.sh 未生效"
+          exit 1
+        fi
+        echo "== miniupnpd 补丁检查通过 =="
+
+    # 内核配置漂移：上游合并后内核升到 6.18.x，kconfig 出现新符号 NET_DSA_TAG_OOB，
     # 而 qualcommax/generic 的 config-6.18 没同步 -> syncconfig 报错。
     # 这里把缺失的符号显式补进目标 config 片段（幂等）。上游同步好之后可删。
     - name: Fix kernel config drift
@@ -181,8 +193,11 @@ jobs:
         # Linux 6.18 bonding triggers unused-function warnings; defconfig may re-enable WERROR.
         sed -i 's/^CONFIG_KERNEL_WERROR=y$/# CONFIG_KERNEL_WERROR is not set/' .config
         make defconfig
-        echo "== 确认 WERROR 状态 =="
+        echo "== 确认关键符号 =="
         grep -n 'CONFIG_KERNEL_WERROR' .config || true
+        grep -q '^CONFIG_TARGET_qualcommax_ipq807x_DEVICE_redmi_ax6-stock=y$' .config \
+          || { echo "::error::defconfig 之后 profile 符号丢失"; exit 1; }
+        echo "== 已启用 luci-app 数量：$(grep -c '^CONFIG_PACKAGE_luci-app-[a-z0-9-]*=y$' .config) =="
         make download -j8
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
@@ -193,25 +208,24 @@ jobs:
         cd openwrt
         echo -e "$(nproc) thread compile"
         make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "compile_status=success" >> $GITHUB_ENV
 
     - name: cp output to upload file
+      if: always()
       run: |
         df -hT
-        mkdir upload
-        cp openwrt/bin/targets/*/*/*.ubi upload/
-        cp openwrt/bin/targets/*/*/*.bin upload/
+        mkdir -p upload
+        cp openwrt/bin/targets/*/*/*.ubi upload/ 2>/dev/null || true
+        cp openwrt/bin/targets/*/*/*.bin upload/ 2>/dev/null || true
+        ls -lh upload/ || true
 
-    # 修复点 5/5：先把产物传成 Artifact 再发 Release，
-    # 即使 Release 再出 403/网络问题，固件也不会像上次那样丢掉。
+    # 先把产物传成 Artifact 再发 Release，
+    # 即使 Release 出 403/网络问题，固件也不会丢。
     - name: Upload firmware artifact
       uses: actions/upload-artifact@v4
       if: always()
       with:
         name: AX6-NSS-firmware
-        path: |
-          upload/*
-          openwrt/build_dir/target-*/linux-*/*/.config
+        path: upload/*
         if-no-files-found: warn
         retention-days: 7
 
@@ -220,6 +234,7 @@ jobs:
 
     - name: Upload OpenWrt Firmware to Release
       uses: ncipollo/release-action@main
+      if: always() && hashFiles('upload/*') != ''
       with:
         tag: AX6_NSS_${{ env.CURRENT_DATE }}
         artifacts: upload/*
@@ -231,17 +246,25 @@ jobs:
           基于 [VIKINGYFY/immortalwrt](https://github.com/VIKINGYFY/immortalwrt) 构建，启用 NSS 硬件加速。
 
           > 首次使用建议 **清空配置全新刷写**（stock 大分区机型）。
+          > 本固件目标 profile：`redmi_ax6-stock`
 
           ### 预装插件
-          - PassWall（Xray + Sing-box）
-          - DDNS-Go
-          - Socat
+          - SmartDNS
+          - AdGuard Home
+          - Nikki（mihomo 内核）
           - UPnP
-          - KMS
-          - EasyTier
           - ZeroTier
-          - WireGuard
-          - frpc
+          - SQM 流控
+          - FullCone NAT
+          - Natmap
+          - Chrony
+          - AutoReboot
+          - RAMFree
+
+          ### DNS 链路（开机自动配置）
+
+          客户端 → AdGuardHome(:53) → SmartDNS(:6053) → Nikki/mihomo(:1053) → 上游
+          若需重配，执行 `/root/dns-chain.sh`。
 
           ### 固件文件
           | 后缀 | 用途 |
@@ -258,8 +281,9 @@ jobs:
 
     - name: Delete old releases
       uses: dev-drprasad/delete-older-releases@master
+      if: always()
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         keep_latest: 10
-        delete_tags : true
+        delete_tags: true
