@@ -1,0 +1,182 @@
+#!/bin/sh
+# ============================================================================
+# AX6 精简固件 —— DNS 三级串联预设
+# 链路：客户端 → ADGuardHome(:53, 广告过滤/统计)
+#              → smartdns(:6053, 分组解析/缓存加速/国内外分流)
+#              → nikki/mihomo(:1053, fake-ip + 域名规则分流)
+#              → 上游 DNS
+#
+# 放置位置（二选一）：
+#   A. 编译期固化：放到 package/base-files/files/etc/uci-defaults/99-ax6-dns-chain
+#      （apply-config.sh 之后不需要任何手工操作，首次开机自动生效一次）
+#   B. 运行期手动执行：scp 到路由器后 `sh /etc/uci-defaults/99-ax6-dns-chain`
+#
+# 幂等：可重复执行，不会重复追加 UCI 段。
+# ============================================================================
+. /lib/functions.sh
+
+ADG_PORT=53
+SMART_PORT=6053
+NIKKI_PORT=1053
+ADG_CFG=/etc/adguardhome/adguardhome.yaml
+SMART_CONF=/etc/smartdns/custom.conf
+
+log_msg() { echo "==> [dns-chain] $1"; }
+
+log_msg "开始配置 ADG(:$ADG_PORT) → smartdns(:$SMART_PORT) → nikki(:$NIKKI_PORT)"
+
+# ---------------------------------------------------------------------------
+# 1) nikki / mihomo —— 链路最后一跳，监听 1053
+# ---------------------------------------------------------------------------
+uci -q batch <<EOF
+set nikki.mixin.dns_enabled='1'
+set nikki.mixin.dns_listen='[::]:$NIKKI_PORT'
+set nikki.mixin.dns_mode='fake-ip'
+set nikki.mixin.fake_ip_range='198.18.0.1/16'
+set nikki.mixin.mode='rule'
+set nikki.mixin.log_level='warning'
+set nikki.mixin.allow_lan='1'
+set nikki.proxy.ipv4_dns_hijack='0'
+set nikki.proxy.ipv6_dns_hijack='0'
+commit nikki
+EOF
+# 说明：ipv4/ipv6_dns_hijack 必须为 0。
+# hijack.ut 里的规则是 `th dport 53 counter redirect to :<$dns_port>`，
+# 若开启，局域网 53 会被 nftables 直接劫持到 mihomo，ADG 永远收不到查询。
+
+# ---------------------------------------------------------------------------
+# 2) smartdns —— 中间层，只监听 6053
+# ---------------------------------------------------------------------------
+uci -q batch <<EOF
+set smartdns.@global[0].enabled='1'
+set smartdns.@smartdns[0].port='$SMART_PORT'
+set smartdns.@global[0].redirect='none'
+commit smartdns
+EOF
+
+mkdir -p /etc/smartdns
+cat >"$SMART_CONF" <<EOF
+# 由 DNS 串联预设生成（ADG 的上游 = smartdns）
+bind [::]:$SMART_PORT
+cache-size 4096
+serve-expired yes
+serve-expired-ttl 259200
+prefetch-domain yes
+
+# 默认分组：国内直连解析
+server 223.5.5.5
+server 119.29.29.29
+
+# foreign 分组：境外域名，交给 nikki 代理解析时用
+server 1.1.1.1 -exclude-default-group -group foreign
+server-tcp 8.8.8.8 -exclude-default-group -group foreign
+
+nameserver /cn/114.114.114.114
+EOF
+
+# ---------------------------------------------------------------------------
+# 3) ADGuardHome —— 入口，监听 53，上游指向 smartdns
+# ---------------------------------------------------------------------------
+/etc/init.d/adguardhome start >/dev/null 2>&1 || true
+sleep 3
+
+if [ -f "$ADG_CFG" ]; then
+	# 3.1 监听 53（默认即 :53，这里做定点纠偏）
+	sed -i -E 's|^  address: .*|  address: 0.0.0.0:53|' "$ADG_CFG" 2>/dev/null || true
+
+	# 3.2 上游整体改写为 smartdns（避免 ADG 自带 DoH 绕过 smartdns/nikki）
+	if ! grep -q "127.0.0.1:$SMART_PORT" "$ADG_CFG" 2>/dev/null; then
+		awk -v smart="127.0.0.1:$SMART_PORT" -v smart6="::1:$SMART_PORT" '
+			BEGIN { skip = 0 }
+			/^upstream_dns:/ {
+				print "upstream_dns:"
+				print "  - " smart
+				print "  - " smart6
+				skip = 1
+				next
+			}
+			skip == 1 {
+				if ($0 ~ /^[a-zA-Z_]/) { skip = 0 } else { next }
+			}
+			{ print }
+		' "$ADG_CFG" >"$ADG_CFG.new" && mv -f "$ADG_CFG.new" "$ADG_CFG"
+	fi
+
+	# 3.3 bootstrap 也走 smartdns，防止 ADG 用 8.8.8.8 直连形成旁路
+	if ! grep -q "^bootstrap_dns:" "$ADG_CFG" 2>/dev/null; then
+		printf 'bootstrap_dns:\n  - 127.0.0.1:%s\n' "$SMART_PORT" >>"$ADG_CFG"
+	fi
+
+	log_msg "ADG 配置已指向 smartdns:$SMART_PORT"
+else
+	log_msg "[警告] $ADG_CFG 不存在，请开机后在 LuCI 里手工把 ADG 上游设为 127.0.0.1:$SMART_PORT"
+fi
+
+# ---------------------------------------------------------------------------
+# 4) dnsmasq —— 交出 53（ADG 接管），只保留 DHCP
+# ---------------------------------------------------------------------------
+uci -q batch <<'EOF'
+set dhcp.@dnsmasq[0].port='0'
+set dhcp.@dnsmasq[0].domainneeded='1'
+set dhcp.@dnsmasq[0].localise_queries='1'
+set dhcp.@dnsmasq[0].authoritative='1'
+commit dhcp
+EOF
+
+# ---------------------------------------------------------------------------
+# 5) DHCP 下发的 DNS 必须指向路由器自己（即 ADG）
+# ---------------------------------------------------------------------------
+uci -q batch <<EOF
+set dhcp.lan.dhcp_option='6,192.168.123.1'
+commit dhcp
+EOF
+
+# ---------------------------------------------------------------------------
+# 6) 局域网放行 53 / 6053 / 1053
+# ---------------------------------------------------------------------------
+for p in 53 6053 1053; do
+	idx=$(uci -q show firewall | grep -c "\.name='ax6dns_$p'" 2>/dev/null || echo 0)
+	if [ "$idx" = "0" ]; then
+		uci -q add firewall rule >/dev/null 2>&1
+		uci -q set firewall.@rule[-1].name="ax6dns_$p" >/dev/null 2>&1
+		uci -q set firewall.@rule[-1].src='lan' >/dev/null 2>&1
+		uci -q set firewall.@rule[-1].proto='tcpudp' >/dev/null 2>&1
+		uci -q set firewall.@rule[-1].dest_port="$p" >/dev/null 2>&1
+		uci -q set firewall.@rule[-1].target='ACCEPT' >/dev/null 2>&1
+	fi
+done
+uci -q commit firewall 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 7) 按依赖顺序重启（自下而上：nikki → smartdns → dnsmasq → ADG）
+# ---------------------------------------------------------------------------
+/etc/init.d/nikki restart >/dev/null 2>&1 || true
+sleep 2
+/etc/init.d/smartdns restart >/dev/null 2>&1 || true
+sleep 2
+/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+sleep 1
+/etc/init.d/adguardhome restart >/dev/null 2>&1 || true
+sleep 3
+
+# ---------------------------------------------------------------------------
+# 8) 自检
+# ---------------------------------------------------------------------------
+echo "--- 监听端口 ---"
+netstat -lnup 2>/dev/null | grep -E ':(53|6053|1053)\b' || \
+	ss -lnup 2>/dev/null | grep -E ':(53|6053|1053)\b' || true
+
+echo "--- 链路逐跳探测（packet_in/answer 由 dnslookup 判定）---"
+if command -v dnslookup >/dev/null 2>&1; then
+	echo -n "ADG(:$ADG_PORT)      : "
+	dnslookup www.baidu.com 127.0.0.1:$ADG_PORT 2>&1 | grep -E 'packet_in|answer' | head -n 1
+	echo -n "smartdns(:$SMART_PORT): "
+	dnslookup www.baidu.com 127.0.0.1:$SMART_PORT 2>&1 | grep -E 'packet_in|answer' | head -n 1
+	echo -n "nikki(:$NIKKI_PORT)  : "
+	dnslookup www.google.com 127.0.0.1:$NIKKI_PORT 2>&1 | grep -E 'packet_in|answer' | head -n 1
+else
+	echo "（dnslookup 不可用，跳过）"
+fi
+
+log_msg "完成。链路：ADG($ADG_PORT) → smartdns($SMART_PORT) → nikki($NIKKI_PORT) → 上游"
+exit 0
