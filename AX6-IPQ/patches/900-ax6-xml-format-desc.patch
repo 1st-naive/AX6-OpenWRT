@@ -1,7 +1,7 @@
-diff --git a/miniupnpd/upnpdescgen.c b/miniupnpd/upnpdescgen.c
+diff --git a/upnpdescgen.c b/upnpdescgen.c
 index 3c8a29d..d267eb6 100644
---- a/miniupnpd/upnpdescgen.c
-+++ b/miniupnpd/upnpdescgen.c
+--- a/upnpdescgen.c
++++ b/upnpdescgen.c
 @@ -921,6 +921,8 @@ genXML(char * str, int * len, int * tmplen,
  				str = strcat_char(str, len, tmplen, '<');
  				str = strcat_str(str, len, tmplen, eltname+1);
