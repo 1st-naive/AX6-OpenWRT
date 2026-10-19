@@ -6,10 +6,12 @@
 #              → nikki/mihomo(:1053, fake-ip + 域名规则分流)
 #              → 上游 DNS
 #
-# 放置位置（二选一）：
-#   A. 编译期固化：放到 package/base-files/files/etc/uci-defaults/99-ax6-dns-chain
-#      （apply-config.sh 之后不需要任何手工操作，首次开机自动生效一次）
-#   B. 运行期手动执行：scp 到路由器后 `sh /etc/uci-defaults/99-ax6-dns-chain`
+# 放置位置：
+#   A. 编译期固化（推荐）：本文件放进仓库 AX6-IPQ/ 目录，由 diy.sh 自动复制到
+#        package/base-files/files/etc/uci-defaults/99-ax6-dns-chain
+#      首次开机执行一次后自删；同时放一份到 /root/dns-chain.sh 供随时重跑。
+#   B. 运行期手动执行：scp 到路由器后 `sh /root/dns-chain.sh`
+#      注意：从 Windows 传过去务必先转 LF，CRLF 会让 /bin/sh 报 not found。
 #
 # 幂等：可重复执行，不会重复追加 UCI 段。
 # ============================================================================
@@ -46,33 +48,385 @@ EOF
 
 # ---------------------------------------------------------------------------
 # 2) smartdns —— 中间层，只监听 6053
+#
+# 【重要】ImmortalWrt 的 smartdns 是 UCI 驱动的：
+#   procd 每次启动都会根据 /etc/config/smartdns 重新生成
+#   /var/etc/smartdns/smartdns.conf，其中的 bind 指令由 UCI 的 port /
+#   tcp_server / ipv6_server 自动推导。
+#
+#   因此在 custom.conf 里再写一条 `bind [::]:6053` 会造成【重复绑定同一地址】，
+#   smartdns 第二个 bind 失败 → 启动即退出 → procd 反复重启，
+#   表现为 `Instance smartdns::smartdns in a crash loop`。
+#
+# 正确做法：
+#   · 端口、上游服务器、分组、缓存等全部用 UCI 设置；
+#   · custom.conf 只放 UCI 无法表达的少量补充选项，且绝不能再写 bind。
 # ---------------------------------------------------------------------------
 uci -q batch <<EOF
-set smartdns.@global[0].enabled='1'
+# --- 主实例：监听 6053，交给 ADG 做上游 ---
+set smartdns.@smartdns[0].enabled='1'
 set smartdns.@smartdns[0].port='$SMART_PORT'
-set smartdns.@global[0].redirect='none'
+# 关闭「自动把 dnsmasq 指向自己」：53 由 ADG 接管，不需要 smartdns 插手，
+# 否则它会在启动时改写 dhcp.@dnsmasq[0]，把我们刻意设置的 port=0 改回去。
+set smartdns.@smartdns[0].auto_set_dnsmasq='0'
+# 关闭第二 DNS 实例：本链路只有一个入口端口，多一个监听只会增加冲突面。
+set smartdns.@smartdns[0].seconddns_enabled='0'
+# 不用 IPv6 监听：AX6 的 LAN 下 IPv6 由 odhcpd 管理，多一个 [::] 绑定只会添乱。
+set smartdns.@smartdns[0].ipv6_server='0'
+# 保留 TCP 监听：部分客户端（DoT/DoH 转发、部分安卓）需要。
+set smartdns.@smartdns[0].tcp_server='1'
+# 缓存与过期策略
+set smartdns.@smartdns[0].serve_expired='1'
+set smartdns.@smartdns[0].cache_persist='1'
+set smartdns.@smartdns[0].resolve_local_hostnames='1'
+set smartdns.@smartdns[0].dualstack_ip_selection='1'
+set smartdns.@smartdns[0].response_mode='fastest-response'
 commit smartdns
 EOF
 
+# ---------------------------------------------------------------------------
+# 【必须删除】speed_check_mode —— 本链路最隐蔽、最难查的坑
+#
+#   smartdns 的 speed-check 会对上游返回的每个 IP 做 tcp:443 / tcp:80 / ping
+#   连通性探测，用来在同一域名的多条 A 记录里挑最快的。
+#
+#   但 mihomo 返回的 fake-ip（198.18.0.0/15，RFC 2544 基准测试网段）
+#   根本不是一个真实可达的地址 —— 探测 100% 失败。
+#
+#   smartdns 没有「这条上游返回的是 fake-ip，跳过测速」的判断，于是：
+#       ① mihomo 秒回 198.18.0.13
+#       ② smartdns 对 198.18.0.13 做 tcp:443 探测 → 失败
+#       ③ 判定该结果无效并丢弃
+#       ④ 转而询问 cn 组（阿里/腾讯 DoH）
+#       ⑤ 拿到被污染的真实 IP（如 157.240.7.20，其实是 Facebook 的地址）
+#       ⑥ 「污染结果」连 TTL 一起写进 /etc/smartdns/smartdns.cache
+#       ⑦ cache_persist='1' → 重启也不清空 → 污染长期存在
+#
+#   症状：nslookup www.google.com 127.0.0.1:6053 返回 157.240.7.20 等
+#         完全不属于该站点的 IP；而 www.baidu.com 等国内域名正常。
+#         极易被误判为「mihomo 没生效」或「DNS 被污染」，实际是测速导致。
+#
+#   代价：关闭后国内域名不再优选最快 IP。但阿里/腾讯 DoH 自身会做就近
+#         调度，返回的 IP 已经是最优的，损失可以忽略。
+#
+#   【绝对不要】把 speed-check-mode 加回来。
+# ---------------------------------------------------------------------------
+uci -q delete smartdns.@smartdns[0].speed_check_mode 2>/dev/null || true
+uci -q commit smartdns
+# 双保险：UCI 里可能残留别的写法（如 speed_check / speed-check-mode）
+uci -q delete smartdns.@smartdns[0].speed_check 2>/dev/null || true
+uci -q delete smartdns.@smartdns[0].speed_check_mode_v4 2>/dev/null || true
+uci -q commit smartdns
+
+# --- 上游服务器：严格加密 + 应急明文兜底 ---
+#
+# 设计目标：
+#   · 默认只用加密上游（DoH / DoH3），运营商看不到任何域名查询；
+#   · 保留一条明文 223.5.5.5 作为「应急」，通过 exclude_default_group='1'
+#     排除在默认解析之外 —— 平时完全不参与，不泄露任何查询；
+#   · DoH 全体失效时，去掉它的 exclude 即可立即恢复上网。
+#
+# 切换应急明文的命令（DoH 全挂时用）：
+#   uci set smartdns.@server[N].exclude_default_group='0'
+#   uci commit smartdns && /etc/init.d/smartdns restart
+#
+# 判定逻辑（两项【独立】检查，互不牵连）：
+#   A. 加密上游：一条都没有时才补齐整套严格 DoH 配置；
+#      已有任意加密条目则【完全不动】，尊重用户自己的选型。
+#   B. 应急明文：无论 A 走哪个分支，都必须保证存在且被排除在默认组外；
+#      缺失时【只追加一条】，不碰已有的任何条目。
+#
+# 之所以拆开：早期版本把 B 写在 A 的 else 分支里，导致
+# 「用户已有 3 条 DoH → else 被跳过 → EMERGENCY 永远加不上」。
+SMART_HAS_ENC=$(uci -q show smartdns \
+	| grep -E "@server\[[0-9]+\]\.ip='(https?|h3|tls|quic)://" | wc -l)
+
+if [ "$SMART_HAS_ENC" -gt 0 ]; then
+	log_msg "已存在 $SMART_HAS_ENC 条加密上游，按用户配置保留，不覆盖"
+else
+	log_msg "[提示] 未检测到加密上游，写入严格 DoH + 应急明文"
+
+	# 清空所有现有上游，重建为确定的 4 条
+	while uci -q delete smartdns.@server[0]; do :; done
+
+	# 1) 阿里 DoH —— 国内主力
+	uci -q add smartdns server >/dev/null
+	uci -q set smartdns.@server[-1].enabled='1'
+	uci -q set smartdns.@server[-1].name='CN-阿里DoH'
+	uci -q set smartdns.@server[-1].ip='https://dns.alidns.com/dns-query'
+	uci -q set smartdns.@server[-1].type='https'
+
+	# 2) 腾讯 DoH —— 国内备用（与阿里互为冗余）
+	uci -q add smartdns server >/dev/null
+	uci -q set smartdns.@server[-1].enabled='1'
+	uci -q set smartdns.@server[-1].name='CN-腾讯DoH'
+	uci -q set smartdns.@server[-1].ip='https://doh.pub/dns-query'
+	uci -q set smartdns.@server[-1].type='https'
+
+	# 3) Cloudflare DoH3 —— 境外分组专用，不参与默认解析
+	uci -q add smartdns server >/dev/null
+	uci -q set smartdns.@server[-1].enabled='1'
+	uci -q set smartdns.@server[-1].name='CF2'
+	uci -q set smartdns.@server[-1].ip='h3://2606:4700::6810:f8f9/dns-query'
+	uci -q set smartdns.@server[-1].type='h3'
+	uci -q set smartdns.@server[-1].http_host='cloudflare-dns.com'
+	uci -q set smartdns.@server[-1].server_group='foreign'
+	uci -q set smartdns.@server[-1].exclude_default_group='1'
+
+	uci -q commit smartdns
+fi
+
+# --- B. 应急明文：独立补齐，与上面是否有加密上游无关 ---
+# 只在「不存在名为 EMERGENCY 的条目」时追加，绝不重复添加。
+#
+# 【为什么用 grep | wc -l 而不是 grep -c】
+#   grep -c 在「无匹配」时会打印 0 但**退出码为 1**，于是 `|| echo 0`
+#   又追加一个 0，变量变成两行 "0\n0"，后面 [ "$X" -eq 0 ] 就会报
+#   `sh: 0: bad number`（实测在路由器上引爆过，把日志写进了别处）。
+#   wc -l 永远输出单个数字、退出码永远 0，没有这个陷阱。
+SMART_HAS_EMG=$(uci -q show smartdns \
+	| grep -E "@server\[[0-9]+\]\.name='EMERGENCY'" | wc -l)
+if [ "$SMART_HAS_EMG" -eq 0 ]; then
+	log_msg "[提示] 未检测到应急明文上游，追加 EMERGENCY（223.5.5.5，已排除在默认组外）"
+	uci -q add smartdns server >/dev/null
+	uci -q set smartdns.@server[-1].enabled='1'
+	uci -q set smartdns.@server[-1].name='EMERGENCY'
+	uci -q set smartdns.@server[-1].ip='223.5.5.5'
+	uci -q set smartdns.@server[-1].server_group='emergency'
+	uci -q set smartdns.@server[-1].exclude_default_group='1'
+	uci -q commit smartdns
+else
+	log_msg "已存在应急明文 EMERGENCY（保持排除在默认组外）"
+	# 修正可能的错误状态：应急条目必须被排除，否则它就参与默认解析了
+	EMG_IDX=$(uci -q show smartdns \
+		| sed -nE "s/^smartdns\.@server\[([0-9]+)\]\.name='EMERGENCY'$/\1/p" | head -n 1)
+	if [ -n "$EMG_IDX" ]; then
+		if [ "$(uci -q get "smartdns.@server[$EMG_IDX].exclude_default_group")" != "1" ]; then
+			uci -q set "smartdns.@server[$EMG_IDX].exclude_default_group='1'"
+			uci -q commit smartdns
+			log_msg "[修正] EMERGENCY 曾被纳入默认组，已重新排除"
+		fi
+	fi
+fi
+
+SMART_TOTAL=$(uci -q show smartdns | grep "@server\[[0-9]*\]=" | wc -l)
+log_msg "上游服务器共 $SMART_TOTAL 条（其中加密 $SMART_HAS_ENC 条）"
+
+# ---------------------------------------------------------------------------
+# 2.3) 分组分流：默认组 = mihomo，国内域名 = cn 组
+#
+# 【为什么必须做这一步】
+#   默认组（server_group 为空且 exclude_default_group != 1 的条目）
+#   决定了「没有被任何 nameserver 规则匹配到的域名」走哪里。
+#
+#   出厂/早期配置的默认组里放的是「CN-阿里DoH + CN-腾讯DoH」两条国内解析器：
+#       www.google.com → 默认组 → 阿里 DoH → 返回【真实 IP】
+#       → mihomo 的 127.0.0.1:1053 从没被问到
+#       → 客户端拿真实 IP 直连 → 被墙 → 表现为「代理没生效」
+#
+#   正确形态（架构 A）：
+#       默认组 = mihomo(127.0.0.1:1053, fake-ip + 规则分流)
+#       国内域名 → cn 组（阿里/腾讯 DoH，直连，不经代理）
+#       其余全部 → 默认组 → mihomo → 按规则决定直连还是出墙
+#
+#   即「白名单国内直连，其余默认走代理」：新出现的境外域名不会漏网。
+#
+# 【实现】只做「保证存在 + 纠正错误状态」，不重建用户的条目：
+#   C1. 默认组里必须有一条指向 mihomo 的明文上游（127.0.0.1:1053）；
+#       没有就追加；有多条则只保留第一条，其余移入 proxy 组。
+#   C2. 任何指向本机回环、端口 = smartdns 自己的上游都会被排除出默认组
+#       —— 那是解析环路，会让 smartdns 自己问自己。
+#   C3. 指向 127.0.0.1:<NIKKI_PORT> 的条目强制留在默认组
+#       （排除掉就等于没接 mihomo）。
+#   C4. 国内 DoH（阿里/腾讯）若名字以 CN- 开头且仍在默认组里，
+#       移入 cn 组并排除出默认组。
+#   C5. 用 domain-rule 声明 /cn/ → cn 组。
+#       注意：这条规则是「粗分流」——凡不在 cn 列表里的域名都走代理，
+#       包括部分国内小众域名。想要精细国内直连，请用 domain-set 导入
+#       国内域名表（见下方提示）。
+# ---------------------------------------------------------------------------
+SMART_SELF_PORT="$(uci -q get smartdns.@smartdns[0].port)"
+NIKKI_UPSTREAM="127.0.0.1:$NIKKI_PORT"
+UCI_CHANGED=0
+
+# 把所有 @server[N] 的索引列出来（一次，避免边改边读导致索引漂移）
+SRV_IDX_LIST="$(uci -q show smartdns \
+	| sed -nE "s/^smartdns\.@server\[([0-9]+)\]=server$/\1/p")"
+
+# --- C1: 保证默认组里有 mihomo ---
+NIKKI_HITS=0
+for i in $SRV_IDX_LIST; do
+	_ip="$(uci -q get "smartdns.@server[$i].ip")"
+	[ "$_ip" = "$NIKKI_UPSTREAM" ] || continue
+	NIKKI_HITS=$((NIKKI_HITS + 1))
+	if [ "$NIKKI_HITS" -gt 1 ]; then
+		# 重复条目：移出默认组
+		uci -q set "smartdns.@server[$i].server_group='proxy'"
+		uci -q set "smartdns.@server[$i].exclude_default_group='1'"
+		UCI_CHANGED=1
+		continue
+	fi
+	# 第一条：强制留在默认组
+	if [ "$(uci -q get "smartdns.@server[$i].exclude_default_group")" = "1" ]; then
+		uci -q delete "smartdns.@server[$i].exclude_default_group"
+		UCI_CHANGED=1
+	fi
+	if [ -n "$(uci -q get "smartdns.@server[$i].server_group")" ]; then
+		uci -q delete "smartdns.@server[$i].server_group"
+		UCI_CHANGED=1
+	fi
+done
+
+if [ "$NIKKI_HITS" -eq 0 ]; then
+	log_msg "[提示] 默认组缺少 mihomo 上游，追加 $NIKKI_UPSTREAM（境外域名将返回 fake-ip）"
+	uci -q add smartdns server >/dev/null
+	uci -q set smartdns.@server[-1].enabled='1'
+	uci -q set smartdns.@server[-1].name='NIKKI-Mihomo'
+	uci -q set smartdns.@server[-1].ip="$NIKKI_UPSTREAM"
+	uci -q set smartdns.@server[-1].type='udp'
+	UCI_CHANGED=1
+else
+	log_msg "默认组已含 mihomo 上游（$NIKKI_UPSTREAM × $NIKKI_HITS）"
+fi
+
+# 重新取索引（上面可能新增了一条）
+SRV_IDX_LIST="$(uci -q show smartdns \
+	| sed -nE "s/^smartdns\.@server\[([0-9]+)\]=server$/\1/p")"
+
+# --- C2/C3/C4: 逐条纠正分组归属 ---
+for i in $SRV_IDX_LIST; do
+	_ip="$(uci -q get "smartdns.@server[$i].ip")"
+	_name="$(uci -q get "smartdns.@server[$i].name")"
+	_grp="$(uci -q get "smartdns.@server[$i].server_group")"
+	_exc="$(uci -q get "smartdns.@server[$i].exclude_default_group")"
+
+	# C3: 指向 mihomo 的，必须在默认组
+	if [ "$_ip" = "$NIKKI_UPSTREAM" ]; then
+		continue
+	fi
+
+	# C2: 指向本机回环且端口等于 smartdns 自己 → 解析环路，赶出默认组
+	case "$_ip" in
+	127.0.0.1:"$SMART_SELF_PORT"|localhost:"$SMART_SELF_PORT"|"::1":"$SMART_SELF_PORT")
+		if [ "$_exc" != "1" ]; then
+			log_msg "[修正] @server[$i] 指向 smartdns 自身（$_ip），已排除出默认组（防解析环路）"
+			uci -q set "smartdns.@server[$i].exclude_default_group='1'"
+			uci -q set "smartdns.@server[$i].server_group='loop'"
+			UCI_CHANGED=1
+		fi
+		continue
+		;;
+	esac
+
+	# C4: 国内 DoH（CN- 前缀）不应留在默认组
+	case "$_name" in
+	CN-*|cn-*)
+		if [ "$_exc" != "1" ] || [ "$_grp" != "cn" ]; then
+			log_msg "[分流] @server[$i] $_name → cn 组（国内直连）"
+			uci -q set "smartdns.@server[$i].server_group='cn'"
+			uci -q set "smartdns.@server[$i].exclude_default_group='1'"
+			UCI_CHANGED=1
+		fi
+		continue
+		;;
+	esac
+done
+
+# --- C5: 声明 /cn/ → cn 组 ---
+# ImmortalWrt 的 domain-rule 段字段：name(域名/IP/domain-set) + server_group
+# 该段可能压根不存在，需要先确认类型存在再 add。
+#
+# 【注意】这个 if 只能用来「决定走 UCI 还是走 custom.conf」，
+#   无论走哪条路最后都必须有 /cn/ 规则 —— 所以外层 else 不报错，
+#   而是留给下面的 custom.conf 兜底（见「兜底分流规则」段）。
+CN_RULE_ADDED=0
+if uci -q get smartdns.@domain-rule[0] >/dev/null 2>&1; then
+	HAS_CN_RULE="$(uci -q show smartdns \
+		| grep -E "@domain-rule\[[0-9]+\]\.name='(/cn/|cn)'" | wc -l)"
+	if [ "$HAS_CN_RULE" -eq 0 ]; then
+		log_msg "[分流] 新增 domain-rule：/cn/ → cn 组"
+		uci -q add smartdns domain-rule >/dev/null
+		uci -q set smartdns.@domain-rule[-1].enabled='1'
+		uci -q set smartdns.@domain-rule[-1].name='/cn/'
+		uci -q set smartdns.@domain-rule[-1].server_group='cn'
+		UCI_CHANGED=1
+		CN_RULE_ADDED=1
+	else
+		log_msg "domain-rule /cn/ 已存在，保持不动"
+		CN_RULE_ADDED=1
+	fi
+else
+	log_msg "[提示] smartdns 无 domain-rule 段类型，改由 custom.conf 写入 /cn/ 规则"
+fi
+
+if [ "$UCI_CHANGED" -eq 1 ]; then
+	uci -q commit smartdns && log_msg "smartdns 分组已更新并提交"
+else
+	log_msg "smartdns 分组无需改动"
+fi
+
+log_msg "[提示] /cn/ 是粗分流：不在 cn 内的域名全部走代理。"
+log_msg "        要精细国内直连，用 domain-set 导入国内域名表并把 -group cn 指过去。"
+
+# --- custom.conf：只放 UCI 表达不了的补充项，绝不包含 bind ---
 mkdir -p /etc/smartdns
 cat >"$SMART_CONF" <<EOF
-# 由 DNS 串联预设生成（ADG 的上游 = smartdns）
-bind [::]:$SMART_PORT
-cache-size 4096
-serve-expired yes
-serve-expired-ttl 259200
+# 由 DNS 串联预设生成 —— 补充项（UCI 无法表达的选项放这里）
+#
+# 【禁止】在本文件中写 bind / bind-tcp：
+#   /var/etc/smartdns/smartdns.conf 已根据 UCI 生成 bind，
+#   此处再写会造成重复绑定，smartdns 启动即崩溃。
+#
+# 端口、上游服务器、缓存开关等都在 /etc/config/smartdns 里，
+# 用 \`uci show smartdns\` 查看。
+
+# 过期结果回复时给的最小 TTL（秒），避免客户端拿到 TTL=0 立刻重查
+serve-expired-reply-ttl 3
+
+# 热门域名预取
 prefetch-domain yes
 
-# 默认分组：国内直连解析
-server 223.5.5.5
-server 119.29.29.29
+# 日志级别：notice 足够，debug 会写满 flash
+log-level notice
 
-# foreign 分组：境外域名，交给 nikki 代理解析时用
-server 1.1.1.1 -exclude-default-group -group foreign
-server-tcp 8.8.8.8 -exclude-default-group -group foreign
-
-nameserver /cn/114.114.114.114
+# ---------------------------------------------------------------------------
+# 兜底分流规则（UCI 的 domain-rule 段不可用时，靠这里生效）
+#
+# 【为什么写在这里】
+#   smartdns 的配置是「先读主配置，再按 conf-file 顺序逐个合并」，
+#   后面的指令会叠加而不是覆盖。所以只要主配置里没有 /cn/ 规则，
+#   这里补一条就是安全的。
+#
+# 【幂等】用 grep 判断主配置里是否已有 domain-rules /cn/，
+#   有就不追加，避免同一规则重复出现（smartdns 48 对重复规则只
+#   warning 不致命，但日志会变脏）。
+#
+# 【注意】判断「主配置要不要有 /cn/」时不能只看 /var/etc/smartdns/
+#   smartdns.conf —— 那是 procd 上一次生成的；本次改了 UCI 但
+#   smartdns 还没重启时它是旧的。所以这里用 /etc/config/smartdns
+#   原文判断「UCI 里是否已经有 /cn/ 规则」，更直接也更准确。
+# ---------------------------------------------------------------------------
+if ! grep -qE "name='(/cn/|cn)'" /etc/config/smartdns 2>/dev/null; then
+	echo 'domain-rules /cn/ -group cn' >>"$SMART_CONF"
+fi
 EOF
+
+if [ ! -s "$SMART_CONF" ]; then
+	log_msg "[警告] $SMART_CONF 写入失败或为空"
+fi
+
+# --- 让 UCI 把 custom.conf 也纳入生成的主配置 ---
+# ImmortalWrt 的 smartdns 通过 conf-file 机制包含额外文件；
+# 具体字段名以实际 uci show 为准，这里两种写法都试一遍，存在的就设。
+if uci -q get smartdns.@smartdns[0]. >/dev/null 2>&1; then
+	uci -q set smartdns.@smartdns[0].custom_conf='/etc/smartdns/custom.conf'
+	uci -q set smartdns.@smartdns[0].conf_file='/etc/smartdns/custom.conf'
+	uci -q commit smartdns
+fi
+# 兜底：直接把 conf.d 作为一个补充目录（部分版本支持 include 整个目录）
+mkdir -p /etc/smartdns/conf.d
+
+log_msg "smartdns 已配置：端口 $SMART_PORT；默认组 = mihomo($NIKKI_UPSTREAM)，国内域名 = cn 组(阿里/腾讯 DoH)"
 
 # ---------------------------------------------------------------------------
 # 3) ADGuardHome —— 入口，监听 53，上游指向 smartdns
@@ -81,30 +435,155 @@ EOF
 sleep 3
 
 if [ -f "$ADG_CFG" ]; then
-	# 3.1 监听 53（默认即 :53，这里做定点纠偏）
-	sed -i -E 's|^  address: .*|  address: 0.0.0.0:53|' "$ADG_CFG" 2>/dev/null || true
+	# 3.0 【关键】Web 管理端口必须与 DNS 端口分开。
+	#     历史 bug：早期版本用
+	#         sed -i -E 's|^  address: .*|  address: 0.0.0.0:53|'
+	#     想改 DNS 监听地址，但 adguardhome.yaml 的 dns 段用的是
+	#     bind_hosts + port，根本没有 address 字段；两个空格缩进的
+	#     `address:` 只存在于 http: 段。结果每次执行都把 Web 端口
+	#     从 3000 改成 53，造成 DNS 与 HTTP 抢同一个 TCP 53：
+	#         [info] webapi: serving url=http://10.0.0.1:53
+	#         [info] dnsproxy: listening to udp addr=[::]:53     ← UDP 成功
+	#         [warn] binding attempt=1 err="...tcp 0.0.0.0:53: bind: address already in use"
+	#         [fatal] listening on tcp addr 0.0.0.0:53          ← TCP 失败
+	#     自己和自己冲突，ADG 进 crash loop。
+	#     现在只做一件事：确保 http.address 的端口不是 53。
+	ADG_WEB_PORT=3000
+	HTTP_ADDR=$(awk '
+		/^http:/ { s = 1; next }
+		s == 1 && /^[a-zA-Z_]/ { s = 0 }
+		s == 1 && /^[[:space:]]+address:/ { print $2; exit }
+	' "$ADG_CFG")
+	case "$HTTP_ADDR" in
+		*":53"|":53")
+			log_msg "[修正] ADG Web 端口是 $HTTP_ADDR，与 DNS 的 53 冲突，改为 0.0.0.0:$ADG_WEB_PORT"
+			awk -v wp="0.0.0.0:$ADG_WEB_PORT" '
+				/^http:/ { s = 1; print; next }
+				s == 1 && /^[a-zA-Z_]/ { s = 0 }
+				s == 1 && /^[[:space:]]+address:/ { print "  address: " wp; next }
+				{ print }
+			' "$ADG_CFG" >"$ADG_CFG.new" && mv -f "$ADG_CFG.new" "$ADG_CFG"
+			;;
+		"")
+			log_msg "[修正] ADG 缺少 http.address（会跟随 DNS 端口），补写 0.0.0.0:$ADG_WEB_PORT"
+			awk -v wp="0.0.0.0:$ADG_WEB_PORT" '
+				/^http:/ { s = 1; print; next }
+				s == 1 && /^[a-zA-Z_]/ && !done { print "  address: " wp; done = 1; s = 0 }
+				{ print }
+				END { if (s == 1 && !done) print "  address: " wp }
+			' "$ADG_CFG" >"$ADG_CFG.new" && mv -f "$ADG_CFG.new" "$ADG_CFG"
+			;;
+		*)
+			log_msg "ADG Web 端口正常（$HTTP_ADDR）"
+			;;
+	esac
 
-	# 3.2 上游整体改写为 smartdns（避免 ADG 自带 DoH 绕过 smartdns/nikki）
-	if ! grep -q "127.0.0.1:$SMART_PORT" "$ADG_CFG" 2>/dev/null; then
-		awk -v smart="127.0.0.1:$SMART_PORT" -v smart6="::1:$SMART_PORT" '
-			BEGIN { skip = 0 }
-			/^upstream_dns:/ {
-				print "upstream_dns:"
-				print "  - " smart
-				print "  - " smart6
-				skip = 1
-				next
-			}
-			skip == 1 {
-				if ($0 ~ /^[a-zA-Z_]/) { skip = 0 } else { next }
-			}
+	# 3.0.1 数据目录必须存在，否则 ADG 无法写 querylog / statistics：
+	#       [error] closing query log: flushing log buffer: nothing to write to a file
+	ADG_DATA=/etc/adguardhome/data
+	mkdir -p "$ADG_DATA"
+	chown adguardhome:adguardhome "$ADG_DATA" 2>/dev/null || true
+	chmod 755 "$ADG_DATA" 2>/dev/null || true
+
+	# 3.1 DNS 监听：adguardhome.yaml 的 dns 段用 bind_hosts + port。
+	#     只在 port 明确不是 53 时才纠正；不碰任何 address 字段。
+	DNS_PORT=$(awk '
+		/^dns:/ { s = 1; next }
+		s == 1 && /^[a-zA-Z_]/ { s = 0 }
+		s == 1 && /^[[:space:]]+port:/ { print $2; exit }
+	' "$ADG_CFG")
+	if [ -n "$DNS_PORT" ] && [ "$DNS_PORT" != "53" ]; then
+		log_msg "[修正] ADG 的 DNS 端口是 $DNS_PORT，改为 53"
+		awk '
+			/^dns:/ { s = 1; print; next }
+			s == 1 && /^[a-zA-Z_]/ { s = 0 }
+			s == 1 && /^[[:space:]]+port:/ { print "  port: 53"; next }
 			{ print }
 		' "$ADG_CFG" >"$ADG_CFG.new" && mv -f "$ADG_CFG.new" "$ADG_CFG"
 	fi
 
+	# 3.2 上游整体改写为 smartdns（避免 ADG 自带 DoH 绕过 smartdns/nikki）
+	#
+	# 【重要】adguardhome.yaml 里 upstream_dns 是 dns: 段的【子键】，
+	#   带两空格缩进：              ← 错误写法（旧脚本假设的）
+	#     upstream_dns:            ← 正确位置
+	#       - 127.0.0.1:6053
+	#   旧脚本用 /^upstream_dns:/ 匹配顶层键，当文件里根本没有该段时
+	#   整个 awk 什么都不做，ADG 于是回落到自带的境外 DoH 默认上游，
+	#   完全绕过 smartdns。这里改为「先删除 dns 段内任何 upstream_dns，
+	#   再在 bind_hosts 之后统一插入一套」，两种情况都能处理。
+	awk -v smart="127.0.0.1:$SMART_PORT" '
+		BEGIN { s = 0; skip = 0; inserted = 0 }
+		# 进入 dns: 段
+		/^dns:/ { s = 1; print; next }
+		# 离开 dns: 段（遇到下一个顶层键）
+		s == 1 && /^[a-zA-Z_]/ {
+			if (!inserted) {
+				print "  upstream_dns:"
+				print "    - " smart
+				inserted = 1
+			}
+			s = 0; skip = 0
+			print; next
+		}
+		s == 1 {
+			# 丢弃任何已有的 upstream_dns 及其列表项
+			if ($0 ~ /^[[:space:]]+upstream_dns:/) { skip = 1; next }
+			if (skip == 1 && $0 ~ /^[[:space:]]+-/) { next }
+			if (skip == 1 && $0 !~ /^[[:space:]]+-/) { skip = 0 }
+			# bind_hosts 之后立即插入
+			if (!inserted && $0 ~ /^[[:space:]]+port:/) {
+				print
+				print "  upstream_dns:"
+				print "    - " smart
+				inserted = 1
+				next
+			}
+			print; next
+		}
+		{ print }
+		END {
+			if (!inserted) {
+				print "  upstream_dns:"
+				print "    - " smart
+			}
+		}
+	' "$ADG_CFG" >"$ADG_CFG.new" && mv -f "$ADG_CFG.new" "$ADG_CFG"
+
+	# 3.2.1 校验：必须能在 dns 段里找到 127.0.0.1:6053
+	if ! grep -q "127.0.0.1:$SMART_PORT" "$ADG_CFG"; then
+		log_msg "[警告] ADG 上游写入失败，请手工把 upstream_dns 设为 127.0.0.1:$SMART_PORT"
+	fi
+
 	# 3.3 bootstrap 也走 smartdns，防止 ADG 用 8.8.8.8 直连形成旁路
-	if ! grep -q "^bootstrap_dns:" "$ADG_CFG" 2>/dev/null; then
-		printf 'bootstrap_dns:\n  - 127.0.0.1:%s\n' "$SMART_PORT" >>"$ADG_CFG"
+	#     同样是 dns: 段的子键，缩进两空格。
+	#
+	# 【必带端口】只写 127.0.0.1 会默认用 53 —— 也就是 ADG 自己，
+	#   一旦把上游改成 DoH 域名就会形成「自己解析自己」的环路。
+	#   统一写成 127.0.0.1:<smartdns 端口>。
+	if ! grep -qE "^[[:space:]]+bootstrap_dns:" "$ADG_CFG" 2>/dev/null; then
+		awk -v smart="127.0.0.1:$SMART_PORT" '
+			BEGIN { s = 0; done = 0 }
+			/^dns:/ { s = 1; print; next }
+			s == 1 && /^[a-zA-Z_]/ && !done {
+				print "  bootstrap_dns:"
+				print "    - " smart
+				done = 1; s = 0
+			}
+			{ print }
+			END {
+				if (!done) {
+					print "  bootstrap_dns:"
+					print "    - " smart
+				}
+			}
+		' "$ADG_CFG" >"$ADG_CFG.new" && mv -f "$ADG_CFG.new" "$ADG_CFG"
+	else
+		# 已存在：把光秃秃的 127.0.0.1 / 127.0.0.1:53 补成 smartdns 端口
+		if grep -qE "^[[:space:]]+-[[:space:]]+(127\.0\.0\.1|127\.0\.0\.1:53)[[:space:]]*$" "$ADG_CFG"; then
+			sed -i -E "s|^([[:space:]]+-[[:space:]]+)(127\.0\.0\.1|127\.0\.0\.1:53)[[:space:]]*$|\1 127.0.0.1:$SMART_PORT|" "$ADG_CFG"
+			log_msg "[修正] bootstrap_dns 指向自身 53，已改为 127.0.0.1:$SMART_PORT"
+		fi
 	fi
 
 	log_msg "ADG 配置已指向 smartdns:$SMART_PORT"
@@ -125,17 +604,110 @@ EOF
 
 # ---------------------------------------------------------------------------
 # 5) DHCP 下发的 DNS 必须指向路由器自己（即 ADG）
+#
+# 【重要】LAN 网段不一定是 192.168.1.0/24 —— 本机实际就是 10.0.0.1/24。
+#   历史 bug：这里硬编码 192.168.1.1，在 10.0.0.x 网络上会把客户端
+#   DNS 指向一个不存在的地址，客户端直接断网。
+#   现在从 network.lan.ipaddr 动态读取；读不到才回退到默认值。
 # ---------------------------------------------------------------------------
-uci -q batch <<EOF
-set dhcp.lan.dhcp_option='6,192.168.123.1'
-commit dhcp
-EOF
+LAN_IP=$(uci -q get network.lan.ipaddr)
+if [ -z "$LAN_IP" ]; then
+	LAN_IP=$(uci -q get network.lan.ipaddr6 2>/dev/null)
+fi
+if [ -z "$LAN_IP" ]; then
+	# 最后兜底：从 br-lan 上取第一个 IPv4
+	LAN_IP=$(ip -4 -o addr show br-lan 2>/dev/null \
+		| awk '{print $4}' | cut -d/ -f1 | head -n 1)
+fi
+if [ -z "$LAN_IP" ]; then
+	log_msg "[警告] 无法确定 LAN IP，dhcp_option 6 保持原值"
+else
+	uci -q set dhcp.lan.dhcp_option="6,$LAN_IP"
+	uci -q commit dhcp
+	log_msg "DHCP 下发的 DNS 已设为 $LAN_IP（ADG）"
+fi
+
+# 5.0 ADG 的 Web 管理端口同样要按 LAN IP 校验可达性（仅提示，不改配置）
+ADG_WEB_PORT=${ADG_WEB_PORT:-3000}
+log_msg "ADG 管理界面：http://$LAN_IP:$ADG_WEB_PORT"
 
 # ---------------------------------------------------------------------------
-# 6) 局域网放行 53 / 6053 / 1053
+# 5.1 防 DNS 泄露：切断运营商 DNS
+#
+#   wan / wan_6 的 peerdns=1 时，运营商下发的 DNS（如 240e:5a::6666）
+#   会写进 /tmp/resolv.conf.d/resolv.conf.auto，并可能经由 odhcpd 的
+#   ra_dns 下发到局域网 IPv6 客户端 —— 纯 IPv6 设备因此完全绕过 ADG。
+# ---------------------------------------------------------------------------
+uci -q set network.wan.peerdns='0'
+if uci -q get network.wan_6 >/dev/null 2>&1; then
+	uci -q set network.wan_6.peerdns='0'
+fi
+if uci -q get network.wan6 >/dev/null 2>&1; then
+	uci -q set network.wan6.peerdns='0'
+fi
+uci -q commit network
+
+# --- 5.2) DHCPv6 的 peerdns 对 odhcp6c 无效，必须靠 dhcp.lan.dns 覆盖 ---
+#
+# 【为什么 peerdns=0 管不住 IPv6】
+#   实测（2026-10-19）：wan/wan6 两个 peerdns=0 之后，ifdown/ifup wan6
+#   仍会把 240e:5a::6666、240e:5b::6666 写回 resolv.conf.auto。
+#   原因：wan6 走 proto=dhcpv6，DNS 由 odhcp6c 通过 DHCPv6 的
+#   OPTION_DNS_SERVERS(23) 取得；ImmortalWrt 这个版本的 odhcp6c 没有把
+#   peerdns=0 翻译成 -R 之类的「忽略 DNS」标志，所以照写不误。
+#
+# 【真正的防线】
+#   odhcpd 下发 RDNSS 时优先用 dhcp.lan.dns；只有该字段为空才去读
+#   resolv.conf.auto。所以只要把 dhcp.lan.dns 钉成路由器自己的
+#   link-local 地址，运营商 DNS 就永远进不了局域网 —— 哪怕
+#   resolv.conf.auto 里还留着它。
+#
+#   实测结果：客户端 ipconfig /all 的「DNS 服务器」只剩 10.0.0.1，
+#   没有任何 240e: 条目，IPv6 侧不再泄露。
+LAN_V6_LL="$(ip -6 addr show br-lan scope link 2>/dev/null \
+	| awk '/inet6 fe80/{print $2}' | cut -d/ -f1 | head -n 1)"
+if [ -n "$LAN_V6_LL" ]; then
+	uci -q set dhcp.lan.dns="$LAN_V6_LL"
+	uci -q set dhcp.lan.ra_dns='1'
+	uci -q commit dhcp
+	log_msg "IPv6 DNS 下发 → $LAN_V6_LL（已覆盖 resolv.conf.auto 里的运营商 DNS）"
+else
+	# 取不到 br-lan 的 link-local 时（例如脚本在非常早期执行），
+	# 退回「关闭 RA 下发 DNS」这个保守选项：不发 DNS 好过发错的。
+	uci -q set dhcp.lan.ra_dns='0'
+	uci -q commit dhcp
+	log_msg "[警告] 未取到 br-lan 的 fe80 地址，已改为 ra_dns=0（不下发 IPv6 DNS）"
+fi
+log_msg "已切断运营商 DNS 下发（wan/wan_6 peerdns=0，lan.dns=路由器 link-local）"
+
+# --- 5.3) 堵住 smartdns 读 resolv.conf.auto 的兜底后门 ---
+#
+# 【机制】/etc/init.d/smartdns 第 662 行：
+#     resolve_file="$(uci -q get dhcp.@dnsmasq[0].resolvfile)"
+#     [ -z "$resolve_file" ] && resolve_file="/tmp/resolv.conf.d/resolv.conf.auto"
+#   第 833 行：
+#     [ -e "$resolve_file" ] && conf_append "resolv-file" "$resolve_file"
+#
+#   也就是说 smartdns 的 resolv-file **不由 smartdns 自己的 UCI 决定**
+#   （写 smartdns.@smartdns[0].resolv_file 是无效字段，不会被读），
+#   而是读 dnsmasq 的 resolvfile，为空则回退到那个被运营商 DNS 污染的文件。
+#   一旦回退，运营商 DNS 就成了默认组的隐藏上游，mihomo 超时时会去问它。
+#
+# 【修法】把 dnsmasq 的 resolvfile 指向一个不存在的路径：
+#   [ -e ] 判断为假 → 根本不生成 resolv-file 行 → 后门关闭。
+#   不能指向 /dev/null：它存在，[ -e ] 通过后会生成
+#   `resolv-file /dev/null`，smartdns 读空文件时会刷告警。
+uci -q delete smartdns.@smartdns[0].resolv_file 2>/dev/null || true
+uci -q set dhcp.@dnsmasq[0].resolvfile='/dev/null/nonexistent'
+uci -q commit dhcp
+uci -q commit smartdns
+log_msg "smartdns resolv-file 后门已关闭（不再读取 resolv.conf.auto）"
+
+# ---------------------------------------------------------------------------
+# 6) 防火墙：局域网放行 53 / 6053 / 1053
 # ---------------------------------------------------------------------------
 for p in 53 6053 1053; do
-	idx=$(uci -q show firewall | grep -c "\.name='ax6dns_$p'" 2>/dev/null || echo 0)
+	idx=$(uci -q show firewall | grep "\.name='ax6dns_$p'" 2>/dev/null | wc -l)
 	if [ "$idx" = "0" ]; then
 		uci -q add firewall rule >/dev/null 2>&1
 		uci -q set firewall.@rule[-1].name="ax6dns_$p" >/dev/null 2>&1
@@ -148,35 +720,230 @@ done
 uci -q commit firewall 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 7) 按依赖顺序重启（自下而上：nikki → smartdns → dnsmasq → ADG）
+# 6.1 防 DNS 泄露：nftables 强制劫持 + 封 DoT
+#
+#   ax6_dns_hijack：LAN 发往任意地址 53 的查询，一律重定向到本机 ADG。
+#                   客户端硬编码 8.8.8.8 / 114.114.114.114 也绕不过去。
+#   ax6_dot_block ：拒绝 LAN 侧的 DNS-over-TLS(853)，
+#                   逼客户端回落到 53（从而被上面的规则截住）。
+#
+#   priority 取 dstnat - 5 / filter - 5，比 fw4 与 nikki 的默认链更靠前，
+#   避免被它们中间的 `return` 放行。
+# ---------------------------------------------------------------------------
+mkdir -p /etc/nftables.d
+cat >/etc/nftables.d/20-ax6-dns-guard.nft <<'EOF'
+chain ax6_dns_hijack {
+	type nat hook prerouting priority dstnat - 5; policy accept;
+	iifname "br-lan" udp dport 53 counter redirect to :53
+	iifname "br-lan" tcp dport 53 counter redirect to :53
+}
+
+chain ax6_dot_block {
+	type filter hook forward priority filter - 5; policy accept;
+	iifname "br-lan" tcp dport 853 counter reject with tcp reset
+	iifname "br-lan" udp dport 853 counter reject
+}
+EOF
+log_msg "已写入 /etc/nftables.d/20-ax6-dns-guard.nft"
+
+# ---------------------------------------------------------------------------
+# 7) 按依赖顺序重启（自下而上：nikki → smartdns → ADG）
+#
+# 【重要】ADG 必须在 smartdns 真正可用之后才启动：
+#   如果 ADG 先起来，它连接 127.0.0.1:6053 的上游会立刻失败并进入
+#   「all upstreams failed」状态，之后即使 smartdns 恢复，ADG 也不会
+#   自己重新绑定 53 —— 表现为 netstat 里完全没有 :53。
+#   因此这里先起 smartdns，用 UDP 探活确认能应答，再起 ADG。
 # ---------------------------------------------------------------------------
 /etc/init.d/nikki restart >/dev/null 2>&1 || true
 sleep 2
+
+# --- 首次部署清一次 smartdns 持久化缓存 ---
+# 旧固件/旧配置年代留下的缓存里可能存着「被污染的境外域名结果」
+# （见上面 speed_check_mode 的说明：测速失败 → 丢弃 fake-ip → 用国内
+#   DoH 的污染结果 → 写进 smartdns.cache → cache_persist 让它在重启后
+#   依然存在）。不清这一次的话，改完配置查 google 还是老结果，
+#   会让人误以为修复没生效。
+# 【只清一次】用标记文件保证重复执行脚本时不再删除用户积累的缓存。
+CACHE_FLAG=/etc/smartdns/.ax6-cache-purged
+if [ ! -e "$CACHE_FLAG" ]; then
+	/etc/init.d/smartdns stop >/dev/null 2>&1 || true
+	if [ -f /etc/smartdns/smartdns.cache ]; then
+		rm -f /etc/smartdns/smartdns.cache
+		log_msg "已清除一次性 smartdns 缓存（防止历史污染结果残留）"
+	fi
+	mkdir -p /etc/smartdns
+	touch "$CACHE_FLAG"
+else
+	log_msg "smartdns 缓存无需清理（$CACHE_FLAG 已存在）"
+fi
+
 /etc/init.d/smartdns restart >/dev/null 2>&1 || true
 sleep 2
+
+# --- 【自检】speed-check 必须不存在 ---
+# smartdns 只在启动时生成 /var/etc/smartdns/smartdns.conf，
+# 所以这项检查必须放在 restart 之后。
+# 一旦发现 speed-check-mode 行，说明 UCI 里还有别的字段在生成它
+# （不同版本的字段名不同），此时境外域名会被测速逻辑杀掉 fake-ip，
+# 整个代理链路失效 —— 直接报错退出，不要静默放过。
+SC_HITS=$(grep -E '^[[:space:]]*speed-check-mode' /var/etc/smartdns/smartdns.conf 2>/dev/null | wc -l)
+if [ "${SC_HITS:-0}" -gt 0 ]; then
+	log_msg "[致命] 生成的 smartdns.conf 里仍有 $SC_HITS 行 speed-check-mode"
+	log_msg "        这会让 mihomo 的 fake-ip 被测速逻辑丢弃，境外域名失效。"
+	log_msg "        排查：uci show smartdns | grep -i speed"
+	grep -nE '^[[:space:]]*speed-check-mode' /var/etc/smartdns/smartdns.conf
+	exit 1
+fi
+log_msg "[自检] speed-check-mode 已确认不存在（fake-ip 不会被测速丢弃）"
+
+# 等某个端口进入监听状态（最多 20 秒）
+# 用 ss/netstat 的 -l 列表判断，不依赖解析器，也不发起任何 DNS 查询。
+wait_port() {
+	_wp_port="$1"
+	_wp_name="$2"
+	_wp_i=0
+	while [ "$_wp_i" -lt 20 ]; do
+		if netstat -ln 2>/dev/null | grep -qE ":${_wp_port}[[:space:]]"; then
+			log_msg "$_wp_name 已在 $_wp_port 监听"
+			return 0
+		fi
+		_wp_i=$((_wp_i + 1))
+		sleep 1
+	done
+	log_msg "[警告] $_wp_name 等待 ${_wp_port} 超时"
+	return 1
+}
+
+wait_port "$SMART_PORT" "smartdns" || true
+
+# dnsmasq 只负责 DHCP，端口设 0 之后仍要重启让它生效
 /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
 sleep 1
-/etc/init.d/adguardhome restart >/dev/null 2>&1 || true
-sleep 3
+fw4 reload >/dev/null 2>&1 || true
+sleep 1
+
+# 起 ADG 前先确保没有残留进程占着 53
+/etc/init.d/adguardhome stop >/dev/null 2>&1 || true
+sleep 1
+
+# --- 53 端口清场 ---
+# ADG 启动时先绑 UDP 53（能成功），再绑 TCP 53；只要 TCP 53 被任何别的
+# 进程占着，就会 fatal 退出并进入 crash loop：
+#   [fatal] listening on tcp addr 0.0.0.0:53: bind: address already in use
+# 因此必须在启动前把 TCP 53 清空。重点排查 dnsmasq（port 被改回 53 时）
+# 与 ADG 自己的僵尸进程。
+who_on_53() {
+	# 输出形如 "dnsmasq 1234" 的进程列表，空表示没人占
+	{
+		netstat -lntp 2>/dev/null | grep -E ':53[[:space:]]'
+		netstat -lnup 2>/dev/null | grep -E ':53[[:space:]]'
+	} | sed -nE 's|.*[0-9]+/([^ ]+).*|\1|p' | sort -u
+}
+
+HOG=$(who_on_53 | grep -v '^AdGuardHome$' || true)
+if [ -n "$HOG" ]; then
+	log_msg "[清场] 53 端口被以下进程占用：$(echo "$HOG" | tr '\n' ' ')"
+	for _p in $HOG; do
+		case "$_p" in
+			dnsmasq)
+				# dnsmasq 必须交出 53，只保留 DHCP
+				uci -q set dhcp.@dnsmasq[0].port='0'
+				uci -q commit dhcp
+				/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+				log_msg "[清场] dnsmasq 已设回 port=0 并重启"
+				;;
+			smartdns)
+				log_msg "[清场] smartdns 误占 53，重启到 $SMART_PORT"
+				/etc/init.d/smartdns restart >/dev/null 2>&1 || true
+				;;
+			*)
+				log_msg "[清场] 强制结束 $_p"
+				killall -9 "$_p" >/dev/null 2>&1 || true
+				;;
+		esac
+	done
+	sleep 3
+fi
+
+# 再确认一次 53 空闲
+STILL=$(who_on_53 || true)
+if [ -n "$STILL" ]; then
+	log_msg "[警告] 清场后 53 仍被占用：$(echo "$STILL" | tr '\n' ' ')"
+fi
+
+/etc/init.d/adguardhome start >/dev/null 2>&1 || true
+
+if wait_port "$ADG_PORT" "AdGuardHome"; then
+	:
+else
+	# 再重启一次：ADG 偶发首次绑定失败，第二次通常能成
+	log_msg "[重试] AdGuardHome 未监听 $ADG_PORT，重启一次"
+	/etc/init.d/adguardhome restart >/dev/null 2>&1 || true
+	wait_port "$ADG_PORT" "AdGuardHome" || \
+		log_msg "[错误] AdGuardHome 仍无法监听 $ADG_PORT，请检查 logread | grep -i adguard"
+fi
+sleep 1
 
 # ---------------------------------------------------------------------------
 # 8) 自检
 # ---------------------------------------------------------------------------
-echo "--- 监听端口 ---"
-netstat -lnup 2>/dev/null | grep -E ':(53|6053|1053)\b' || \
-	ss -lnup 2>/dev/null | grep -E ':(53|6053|1053)\b' || true
+echo "--- 监听端口（应有 :53 / :6053 / :1053）---"
+netstat -ln 2>/dev/null | grep -E ':(53|6053|1053)[[:space:]]' || echo "（一个都没监听！）"
 
-echo "--- 链路逐跳探测（packet_in/answer 由 dnslookup 判定）---"
-if command -v dnslookup >/dev/null 2>&1; then
-	echo -n "ADG(:$ADG_PORT)      : "
-	dnslookup www.baidu.com 127.0.0.1:$ADG_PORT 2>&1 | grep -E 'packet_in|answer' | head -n 1
-	echo -n "smartdns(:$SMART_PORT): "
-	dnslookup www.baidu.com 127.0.0.1:$SMART_PORT 2>&1 | grep -E 'packet_in|answer' | head -n 1
-	echo -n "nikki(:$NIKKI_PORT)  : "
-	dnslookup www.google.com 127.0.0.1:$NIKKI_PORT 2>&1 | grep -E 'packet_in|answer' | head -n 1
+echo "--- 防泄露规则 ---"
+nft list chain inet fw4 ax6_dns_hijack 2>/dev/null | grep -E 'dport 53' || echo "（未生效，检查 fw4 是否支持 /etc/nftables.d）"
+nft list chain inet fw4 ax6_dot_block 2>/dev/null | grep -E 'dport 853' || echo "（未生效）"
+
+echo "--- 上游服务器（应只有 https / h3，明文仅 EMERGENCY 且被排除）---"
+uci -q show smartdns | grep -E '@server\[[0-9]+\]\.(name|ip|exclude_default_group)'
+
+echo "--- 链路逐跳探测 ---"
+# 逐跳用 nslookup 显式指定服务器端口，不依赖 /etc/resolv.conf。
+# busybox nslookup 语法：nslookup <host> [<server>[:<port>]]
+probe() {
+	_p_name="$1"
+	_p_port="$2"
+	_p_host="$3"
+	if command -v dnslookup >/dev/null 2>&1; then
+		_p_out=$(dnslookup "$_p_host" 127.0.0.1:$_p_port 2>&1 | head -n 3)
+	elif command -v nslookup >/dev/null 2>&1; then
+		_p_out=$(nslookup "$_p_host" "127.0.0.1:$_p_port" 2>&1 | head -n 6)
+	else
+		_p_out="（无 nslookup / dnslookup 可用）"
+	fi
+	case "$_p_out" in
+		*"${_p_host}"*|*Address*|*answer*|*packet_in*)
+			echo "  [OK]   $_p_name(:$_p_port) → $_p_host"
+			;;
+		*)
+			echo "  [FAIL] $_p_name(:$_p_port) → $_p_host"
+			echo "         $(echo "$_p_out" | head -n 2 | tr '\n' ' ')"
+			;;
+	esac
+}
+
+probe "AdGuardHome" "$ADG_PORT"   "www.baidu.com"
+probe "smartdns"     "$SMART_PORT" "www.baidu.com"
+probe "nikki/mihomo" "$NIKKI_PORT" "www.google.com"
+
+echo "--- 系统解析器（/etc/resolv.conf）---"
+cat /etc/resolv.conf 2>/dev/null | grep -v '^#' | grep . || echo "（空）"
+
+log_msg "完成。链路：ADG($ADG_PORT) → smartdns($SMART_PORT) → 加密上游"
+
+# 应急明文的索引按实际位置查找，不写死数字。
+#
+# 【为什么这里要重新数一遍】
+#   早先的版本用一个 grep -c 判断，而 grep -c 的 "0\n0" 问题（见 5.2 段
+#   上方注释）会让这里误报「未找到 EMERGENCY」—— 前面明明刚打印过
+#   「已存在应急明文 EMERGENCY」，两句话自相矛盾。现在统一用
+#   uci show 取全部索引、取第一条，和 2.2) 段的判断口径完全一致。
+EMG_IDX_FINAL=$(uci -q show smartdns \
+	| sed -nE "s/^smartdns\.@server\[([0-9]+)\]\.name='EMERGENCY'$/\1/p" | head -n 1)
+if [ -n "$EMG_IDX_FINAL" ]; then
+	log_msg "应急明文启用方法：uci set smartdns.@server[$EMG_IDX_FINAL].exclude_default_group='0' && uci commit smartdns && /etc/init.d/smartdns restart"
 else
-	echo "（dnslookup 不可用，跳过）"
+	log_msg "[警告] 未找到 EMERGENCY 条目，应急切换不可用"
 fi
-
-log_msg "完成。链路：ADG($ADG_PORT) → smartdns($SMART_PORT) → nikki($NIKKI_PORT) → 上游"
 exit 0

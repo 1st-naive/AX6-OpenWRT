@@ -51,7 +51,14 @@ do
 	set_sym "$s" n
 done
 
-echo "==> [2/4] 保留 PassWall 全家 / ISC-DHCP 关闭（沿用既有结论，避免和 dnsmasq 抢 53/546）"
+echo "==> [2/4] 关闭 PassWall 代理全家、其它网络共享插件与 ISC-DHCP 套件"
+# PassWall / SSR+ / OpenClash / homeproxy：与 nikki(mihomo) 功能重叠，两套代理同时存在会互相劫持流量。
+# alist / webdav / samba4 / ksmbd / minidlna / gecoosac：本机精简清单外，未保留。
+# ISC-DHCP 套件：isc-dhcp-server 与 dnsmasq 同时提供 DHCPv4 会重复应答
+#   （日志表现为 "no free leases" / "unknown lease"）；
+#   isc-dhcp-relay-ipv6 的 547 与 odhcpd 的 DHCPv6 冲突；
+#   isc-dhcp-client-ipv6 + generate-ipv6-address 在 dnsmasq 体系下无必要。
+# 注意：53 是 dnsmasq 的 DNS 端口，与上述 ISC-DHCP 组件无关，别写成 53 冲突。
 for s in \
 	CONFIG_PACKAGE_luci-app-passwall CONFIG_PACKAGE_luci-app-passwall2 \
 	CONFIG_PACKAGE_luci-app-ssr-plus CONFIG_PACKAGE_luci-app-openclash \
